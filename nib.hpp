@@ -1,4 +1,3 @@
-cpp
 // nibble_encoder.hpp
 #ifndef NIBBLE_ENCODER_HPP
 #define NIBBLE_ENCODER_HPP
@@ -19,6 +18,8 @@ cpp
 #include <bitset>
 #include <queue>
 #include <cmath>
+#include <cstring>
+#include <utility>
 
 namespace nibble {
 
@@ -198,7 +199,9 @@ public:
 template<typename CharT>
 class ResourceLoader {
 public:
-    void load_templates(const std::string&) {}
+    void load_templates(const std::string&) {
+        throw std::runtime_error("Template loading is not supported");
+    }
     void load_word_dictionary(const std::string&) {}
 };
 
@@ -211,25 +214,6 @@ template<typename CharT> class IBackendCompressor;
 template<typename CharT> class NibbleEncoder;
 
 } // namespace nibble
-
-#endif // NIBBLE_ENCODER_HPP
-File 2: nibble_transforms.hpp (All Transform Classes)
-cpp
-// nibble_transforms.hpp
-#ifndef NIBBLE_TRANSFORMS_HPP
-#define NIBBLE_TRANSFORMS_HPP
-
-#include "nibble_encoder.hpp"
-#include <vector>
-#include <cstdint>
-#include <algorithm>
-#include <array>
-#include <unordered_map>
-#include <queue>
-#include <cmath>
-#include <functional>
-#include <bitset>
-#include <cstring>
 
 namespace nibble {
 
@@ -263,9 +247,6 @@ public:
     explicit XORMeanNormalizeTransform(size_t window = XOR_WINDOW_SIZE) : window_size(window) {}
     
     std::vector<uint8_t> apply(std::vector<uint8_t>& nibbles) override {
-        std::vector<uint8_t> metadata;
-        metadata.reserve(nibbles.size());
-        
         std::vector<uint8_t> window;
         window.reserve(window_size);
         uint32_t sum = 0;
@@ -275,30 +256,29 @@ public:
             if (!window.empty()) {
                 mean = static_cast<uint8_t>((sum / window.size()) & 0x0F);
             }
-            
-            metadata.push_back(mean);
+            const uint8_t original = nibbles[i];
             nibbles[i] ^= mean;
-            
-            window.push_back(nibbles[i]);
-            sum += nibbles[i];
+            window.push_back(original);
+            sum += original;
             if (window.size() > window_size) {
                 sum -= window.front();
                 window.erase(window.begin());
             }
         }
         
-        return metadata;
+        return {};
     }
     
-    void reverse(std::vector<uint8_t>& nibbles, const std::vector<uint8_t>& metadata) override {
+    void reverse(std::vector<uint8_t>& nibbles, const std::vector<uint8_t>& /*metadata*/) override {
         std::vector<uint8_t> window;
         window.reserve(window_size);
         uint32_t sum = 0;
         
-        for (size_t i = 0; i < nibbles.size() && i < metadata.size(); i++) {
-            uint8_t mean = metadata[i];
+        for (size_t i = 0; i < nibbles.size(); i++) {
+            uint8_t mean = window.empty()
+                ? 0
+                : static_cast<uint8_t>((sum / window.size()) & 0x0F);
             nibbles[i] ^= mean;
-            
             window.push_back(nibbles[i]);
             sum += nibbles[i];
             if (window.size() > window_size) {
@@ -327,16 +307,40 @@ public:
         std::vector<uint8_t> metadata;
         
         std::vector<size_t> indices(n);
+        std::vector<size_t> classes(n);
         for (size_t i = 0; i < n; i++) indices[i] = i;
-        
         std::sort(indices.begin(), indices.end(), [&](size_t a, size_t b) {
-            for (size_t k = 0; k < n; k++) {
-                uint8_t na = nibbles[(a + k) % n];
-                uint8_t nb = nibbles[(b + k) % n];
-                if (na != nb) return na < nb;
-            }
-            return false;
+            return nibbles[a] == nibbles[b] ? a < b : nibbles[a] < nibbles[b];
         });
+        size_t class_count = 1;
+        for (size_t i = 0; i < n; ++i) {
+            if (i > 0 && nibbles[indices[i]] != nibbles[indices[i - 1]]) {
+                ++class_count;
+            }
+            classes[indices[i]] = class_count - 1;
+        }
+
+        for (size_t length = 1; length < n && class_count < n; length *= 2) {
+            std::sort(indices.begin(), indices.end(), [&](size_t a, size_t b) {
+                const auto a_key = std::make_pair(classes[a], classes[(a + length) % n]);
+                const auto b_key = std::make_pair(classes[b], classes[(b + length) % n]);
+                return a_key == b_key ? a < b : a_key < b_key;
+            });
+            std::vector<size_t> next_classes(n);
+            class_count = 1;
+            for (size_t i = 0; i < n; ++i) {
+                if (i > 0) {
+                    size_t prev = indices[i - 1];
+                    size_t curr = indices[i];
+                    if (classes[prev] != classes[curr] ||
+                        classes[(prev + length) % n] != classes[(curr + length) % n]) {
+                        ++class_count;
+                    }
+                }
+                next_classes[indices[i]] = class_count - 1;
+            }
+            classes = std::move(next_classes);
+        }
         
         std::vector<uint8_t> transformed(n);
         size_t original_index = 0;
@@ -345,8 +349,9 @@ public:
             if (indices[i] == 0) original_index = i;
         }
         
-        metadata.push_back((original_index >> 8) & 0xFF);
-        metadata.push_back(original_index & 0xFF);
+        for (unsigned shift = 0; shift < 32; shift += 8) {
+            metadata.push_back(static_cast<uint8_t>(original_index >> shift));
+        }
         
         nibbles = std::move(transformed);
         return metadata;
@@ -354,9 +359,12 @@ public:
     
     void reverse(std::vector<uint8_t>& nibbles, const std::vector<uint8_t>& metadata) override {
         size_t n = nibbles.size();
-        if (n == 0 || metadata.size() < 2) return;
+        if (n == 0 || metadata.size() < 4) return;
         
-        size_t original_index = (metadata[0] << 8) | metadata[1];
+        size_t original_index = 0;
+        for (unsigned shift = 0; shift < 32; shift += 8) {
+            original_index |= static_cast<size_t>(metadata[shift / 8]) << shift;
+        }
         
         std::vector<uint8_t> first_col = nibbles;
         std::sort(first_col.begin(), first_col.end());
@@ -385,7 +393,7 @@ public:
     
     TransformID get_id() const override { return TransformID::BWT; }
     std::string get_name() const override { return "BWT"; }
-    size_t get_metadata_size() const override { return 2; }
+    size_t get_metadata_size() const override { return 4; }
 };
 
 // ============================================================================
@@ -470,7 +478,7 @@ public:
                     encoded.push_back(0xFF);
                 }
                 encoded.push_back(current);
-            } else if (run_len <= 15) {
+            } else if (run_len < 15) {
                 encoded.push_back(0xFD);
                 encoded.push_back(static_cast<uint8_t>(run_len));
                 encoded.push_back(current);
@@ -483,15 +491,11 @@ public:
             }
         }
         
-        std::vector<uint8_t> metadata;
-        metadata.push_back(static_cast<uint8_t>(nibbles.size() & 0xFF));
-        metadata.push_back(static_cast<uint8_t>((nibbles.size() >> 8) & 0xFF));
-        
         nibbles = std::move(encoded);
-        return metadata;
+        return {};
     }
     
-    void reverse(std::vector<uint8_t>& nibbles, const std::vector<uint8_t>& metadata) override {
+    void reverse(std::vector<uint8_t>& nibbles, const std::vector<uint8_t>& /*metadata*/) override {
         std::vector<uint8_t> decoded;
         
         size_t i = 0;
@@ -528,7 +532,7 @@ public:
     
     TransformID get_id() const override { return TransformID::RLE; }
     std::string get_name() const override { return "RLE"; }
-    size_t get_metadata_size() const override { return 2; }
+    size_t get_metadata_size() const override { return 0; }
 };
 
 // ============================================================================
@@ -610,15 +614,13 @@ private:
     
 public:
     std::vector<uint8_t> apply(std::vector<uint8_t>& nibbles) override {
-        std::vector<uint8_t> metadata;
-        metadata.reserve(nibbles.size());
-        
-        for (uint8_t n : nibbles) metadata.push_back(get_context(n));
+        std::vector<uint8_t> metadata((nibbles.size() + 3) / 4, 0);
+        for (size_t i = 0; i < nibbles.size(); ++i) {
+            metadata[i / 4] |= static_cast<uint8_t>(get_context(nibbles[i]) << ((i % 4) * 2));
+        }
         
         std::vector<uint8_t> groups[4];
         for (uint8_t n : nibbles) groups[get_context(n)].push_back(n);
-        
-        for (int i = 0; i < 4; i++) std::sort(groups[i].begin(), groups[i].end());
         
         std::vector<uint8_t> sorted;
         for (int i = 0; i < 4; i++) {
@@ -630,11 +632,16 @@ public:
     }
     
     void reverse(std::vector<uint8_t>& nibbles, const std::vector<uint8_t>& metadata) override {
-        if (metadata.size() != nibbles.size()) return;
+        if (metadata.size() != (nibbles.size() + 3) / 4) {
+            throw std::runtime_error("Invalid context sort metadata");
+        }
         
         std::vector<uint8_t> reconstructed(nibbles.size());
         std::vector<size_t> group_indices[4];
-        for (size_t i = 0; i < metadata.size(); i++) group_indices[metadata[i]].push_back(i);
+        for (size_t i = 0; i < nibbles.size(); i++) {
+            uint8_t context = (metadata[i / 4] >> ((i % 4) * 2)) & 0x03;
+            group_indices[context].push_back(i);
+        }
         
         size_t pos = 0;
         for (int ctx = 0; ctx < 4; ctx++) {
@@ -669,8 +676,9 @@ private:
                 if (nibbles[i] == nibbles[i - lag]) correct++;
                 total++;
             }
-            double accuracy = static_cast<double>(correct) / total;
-            if (accuracy > 0.5) lags.push_back(lag);
+            if (total > 0 && static_cast<double>(correct) / total > 0.5) {
+                lags.push_back(lag);
+            }
         }
         if (lags.empty()) lags.push_back(1);
         return lags;
@@ -748,9 +756,9 @@ private:
     static constexpr double SMOOTHING = 0.01;
     
     struct MarkovState {
-        std::array<double, STATE_SIZE> probs;
+        std::array<size_t, STATE_SIZE> counts;
         size_t count;
-        MarkovState() : probs{}, count(0) {}
+        MarkovState() : counts{}, count(0) {}
     };
     
     std::unordered_map<uint32_t, MarkovState> models;
@@ -768,13 +776,8 @@ private:
     
     void update_model(uint32_t context, uint8_t value) {
         auto& state = models[context];
+        state.counts[value]++;
         state.count++;
-        double alpha = SMOOTHING;
-        double total = state.count + alpha * STATE_SIZE;
-        for (int v = 0; v < STATE_SIZE; v++) {
-            double count = (v == value) ? 1.0 : 0.0;
-            state.probs[v] = (count + alpha) / total;
-        }
     }
     
     uint8_t predict(uint32_t context) {
@@ -782,11 +785,11 @@ private:
         if (it == models.end()) return 0;
         
         uint8_t best = 0;
-        double best_prob = 0;
-        for (int v = 0; v < STATE_SIZE; v++) {
-            if (it->second.probs[v] > best_prob) {
-                best_prob = it->second.probs[v];
-                best = static_cast<uint8_t>(v);
+        size_t best_count = 0;
+        for (size_t value = 0; value < STATE_SIZE; value++) {
+            if (it->second.counts[value] > best_count) {
+                best_count = it->second.counts[value];
+                best = static_cast<uint8_t>(value);
             }
         }
         return best;
@@ -800,16 +803,12 @@ public:
         metadata.push_back(static_cast<uint8_t>(current_order));
         
         models.clear();
-        for (size_t i = current_order; i < nibbles.size(); i++) {
-            uint32_t ctx = get_context(nibbles, i);
-            update_model(ctx, nibbles[i]);
-        }
-        
         std::vector<uint8_t> residuals(nibbles.size());
         for (size_t i = 0; i < nibbles.size(); i++) {
             uint32_t ctx = get_context(nibbles, i);
             uint8_t pred = predict(ctx);
             residuals[i] = nibbles[i] ^ pred;
+            update_model(ctx, nibbles[i]);
         }
         
         nibbles = std::move(residuals);
@@ -871,28 +870,25 @@ public:
     
     void reverse(std::vector<uint8_t>& nibbles, const std::vector<uint8_t>& metadata) override {
         size_t pos = 0;
-        
+        std::vector<uint8_t> pnl_metadata;
+        std::vector<uint8_t> hmc_metadata;
         while (pos < metadata.size()) {
-            if (metadata[pos] == 0x02 && pos + 2 < metadata.size()) {
-                size_t hmc_size = metadata[pos + 1];
-                std::vector<uint8_t> hmc_meta(
-                    metadata.begin() + pos + 2,
-                    metadata.begin() + pos + 2 + hmc_size);
-                hmc.reverse(nibbles, hmc_meta);
-                pos += 2 + hmc_size;
+            if (metadata.size() - pos < 2) {
+                throw std::runtime_error("Invalid combined predictor metadata");
             }
-            else if (metadata[pos] == 0x01 && pos + 2 < metadata.size()) {
-                size_t pnl_size = metadata[pos + 1];
-                std::vector<uint8_t> pnl_meta(
-                    metadata.begin() + pos + 2,
-                    metadata.begin() + pos + 2 + pnl_size);
-                pnl.reverse(nibbles, pnl_meta);
-                pos += 2 + pnl_size;
+            const uint8_t transform_id = metadata[pos++];
+            const size_t length = metadata[pos++];
+            if (length > metadata.size() - pos) {
+                throw std::runtime_error("Truncated combined predictor metadata");
             }
-            else {
-                pos++;
-            }
+            std::vector<uint8_t> part(metadata.begin() + pos, metadata.begin() + pos + length);
+            if (transform_id == 0x01) pnl_metadata = std::move(part);
+            else if (transform_id == 0x02) hmc_metadata = std::move(part);
+            else throw std::runtime_error("Unknown combined predictor transform");
+            pos += length;
         }
+        hmc.reverse(nibbles, hmc_metadata);
+        pnl.reverse(nibbles, pnl_metadata);
     }
     
     TransformID get_id() const override { return TransformID::COMBINED_PREDICTOR; }
@@ -1054,6 +1050,7 @@ public:
                     encoded.push_back(nibbles[i]);
                 }
             }
+            if (encoded.size() + metadata.size() >= nibbles.size()) return {};
             nibbles = std::move(encoded);
         }
         
@@ -1108,18 +1105,15 @@ private:
     
     void build_chain(const std::vector<uint8_t>& nibbles, size_t window) {
         chain.clear();
-        for (size_t i = 0; i < nibbles.size() - window; i++) {
-            size_t match_len = 0;
-            for (size_t j = 1; j < window && i + j < nibbles.size(); j++) {
-                if (nibbles[i] == nibbles[i + j]) match_len++;
-                else break;
+        for (size_t i = 0; i < nibbles.size();) {
+            size_t length = 1;
+            while (length < window && length < 255 &&
+                   i + length < nibbles.size() &&
+                   nibbles[i] == nibbles[i + length]) {
+                ++length;
             }
-            if (match_len > 0) {
-                chain.push_back(match_len);
-                i += match_len;
-            } else {
-                chain.push_back(1);
-            }
+            chain.push_back(length);
+            i += length;
         }
     }
     
@@ -1135,7 +1129,9 @@ public:
             signature = (signature << 1) | (signature >> 7);
         }
         metadata.push_back(signature);
-        metadata.push_back(static_cast<uint8_t>(chain.size()));
+        for (unsigned shift = 0; shift < 32; shift += 8) {
+            metadata.push_back(static_cast<uint8_t>(chain.size() >> shift));
+        }
         for (size_t len : chain) metadata.push_back(static_cast<uint8_t>(len & 0xFF));
         
         std::vector<uint8_t> reordered;
@@ -1151,12 +1147,18 @@ public:
     }
     
     void reverse(std::vector<uint8_t>& nibbles, const std::vector<uint8_t>& metadata) override {
-        if (metadata.size() < 2) return;
+        if (metadata.size() < 5) throw std::runtime_error("Invalid multimove metadata");
         
-        size_t chain_size = metadata[1];
+        size_t chain_size = 0;
+        for (unsigned shift = 0; shift < 32; shift += 8) {
+            chain_size |= static_cast<size_t>(metadata[1 + shift / 8]) << shift;
+        }
+        if (chain_size > metadata.size() - 5) {
+            throw std::runtime_error("Truncated multimove metadata");
+        }
         chain.clear();
-        for (size_t i = 0; i < chain_size && i + 2 < metadata.size(); i++) {
-            chain.push_back(metadata[i + 2]);
+        for (size_t i = 0; i < chain_size; i++) {
+            chain.push_back(metadata[i + 5]);
         }
         
         std::vector<uint8_t> reconstructed;
@@ -1187,7 +1189,7 @@ private:
         WaveletNode* left;
         WaveletNode* right;
         uint8_t low, high;
-        WaveletNode(uint8_t l, uint8_t h) : low(l), high(h), left(nullptr), right(nullptr) {}
+        WaveletNode(uint8_t l, uint8_t h) : left(nullptr), right(nullptr), low(l), high(h) {}
         ~WaveletNode() { delete left; delete right; }
     };
     
@@ -1356,21 +1358,6 @@ public:
 
 } // namespace nibble
 
-#endif // NIBBLE_TRANSFORMS_HPP
-File 3: nibble_backends.hpp (Backend Compressors)
-cpp
-// nibble_backends.hpp
-#ifndef NIBBLE_BACKENDS_HPP
-#define NIBBLE_BACKENDS_HPP
-
-#include "nibble_encoder.hpp"
-#include <vector>
-#include <cstdint>
-#include <array>
-#include <queue>
-#include <bitset>
-#include <cmath>
-
 namespace nibble {
 
 // ============================================================================
@@ -1396,16 +1383,6 @@ class NibbleLZ77Compressor : public IBackendCompressor<CharT> {
 private:
     size_t window_size;
     size_t lookahead_size;
-    
-    void encode_value(std::vector<uint8_t>& output, size_t value) {
-        if (value < 0x0F) {
-            output.push_back(static_cast<uint8_t>(value));
-        } else {
-            output.push_back(0x0F);
-            output.push_back(static_cast<uint8_t>(value & 0x0F));
-            output.push_back(static_cast<uint8_t>((value >> 4) & 0x0F));
-        }
-    }
     
 public:
     NibbleLZ77Compressor(size_t window = LZ77_WINDOW_SIZE, size_t lookahead = LZ77_LOOKAHEAD)
@@ -1436,12 +1413,15 @@ public:
             if (best_len >= 2) {
                 output.push_back(LZ77_MATCH_MARKER);
                 output.push_back(0x0F);
-                encode_value(output, best_dist);
+                for (unsigned shift = 0; shift < 32; shift += 8) {
+                    output.push_back(static_cast<uint8_t>(best_dist >> shift));
+                }
                 output.push_back(static_cast<uint8_t>(best_len));
                 i += best_len;
             } else {
                 if (nibbles[i] == LZ77_MATCH_MARKER || nibbles[i] == CONTROL_ESCAPE) {
                     output.push_back(CONTROL_ESCAPE);
+                    output.push_back(0x01);
                 }
                 output.push_back(nibbles[i]);
                 i++;
@@ -1466,19 +1446,14 @@ public:
                 break;
             }
             
-            if (nib == LZ77_MATCH_MARKER && i + 2 < n && compressed[i + 1] == 0x0F) {
+            if (nib == LZ77_MATCH_MARKER && i + 6 < n && compressed[i + 1] == 0x0F) {
                 i += 2;
-                
                 size_t distance = 0;
-                if (i < n && compressed[i] < 0x0F) {
-                    distance = compressed[i++];
-                } else if (i + 2 < n && compressed[i] == 0x0F) {
-                    distance = compressed[i + 1];
-                    distance |= (static_cast<size_t>(compressed[i + 2]) << 4);
-                    i += 3;
+                for (unsigned shift = 0; shift < 32; shift += 8) {
+                    distance |= static_cast<size_t>(compressed[i++]) << shift;
                 }
                 
-                size_t length = (i < n) ? compressed[i++] : 0;
+                size_t length = compressed[i++];
                 
                 if (distance > 0 && distance <= output.size()) {
                     size_t start = output.size() - distance;
@@ -1486,9 +1461,9 @@ public:
                         output.push_back(output[start + j]);
                     }
                 }
-            } else if (nib == CONTROL_ESCAPE && i + 1 < n) {
-                output.push_back(compressed[i + 1]);
-                i += 2;
+            } else if (nib == CONTROL_ESCAPE && i + 2 < n && compressed[i + 1] == 0x01) {
+                output.push_back(compressed[i + 2]);
+                i += 3;
             } else {
                 output.push_back(nib);
                 i++;
@@ -1588,24 +1563,24 @@ private:
     static constexpr uint32_t MAX_RANGE = 0xFFFFFFFF;
     static constexpr uint32_t HALF = 0x80000000;
     static constexpr uint32_t QUARTER = 0x40000000;
-    static constexpr size_t NIBBLE_VALUES = 16;
+    static constexpr size_t SYMBOL_COUNT = 256;
     
     struct FrequencyTable {
-        std::array<size_t, NIBBLE_VALUES + 1> freq;
-        std::array<size_t, NIBBLE_VALUES + 2> cumulative;
+        std::array<size_t, SYMBOL_COUNT + 1> freq;
+        std::array<size_t, SYMBOL_COUNT + 2> cumulative;
         size_t total;
         
         FrequencyTable() : freq{}, cumulative{}, total(0) { initialize_adaptive(); }
         
         void initialize_adaptive() {
-            for (size_t i = 0; i <= NIBBLE_VALUES; i++) freq[i] = 1;
-            total = NIBBLE_VALUES + 1;
+            for (size_t i = 0; i <= SYMBOL_COUNT; i++) freq[i] = 1;
+            total = SYMBOL_COUNT + 1;
             rebuild_cumulative();
         }
         
         void rebuild_cumulative() {
             cumulative[0] = 0;
-            for (size_t i = 0; i <= NIBBLE_VALUES; i++) {
+            for (size_t i = 0; i <= SYMBOL_COUNT; i++) {
                 cumulative[i + 1] = cumulative[i] + freq[i];
             }
         }
@@ -1616,10 +1591,10 @@ private:
             rebuild_cumulative();
         }
         
-        size_t get_low(uint8_t symbol) const { return cumulative[symbol]; }
-        size_t get_high(uint8_t symbol) const { return cumulative[symbol + 1]; }
+        size_t get_low(size_t symbol) const { return cumulative[symbol]; }
+        size_t get_high(size_t symbol) const { return cumulative[symbol + 1]; }
         size_t get_total() const { return total; }
-        size_t get_eof_symbol() const { return NIBBLE_VALUES; }
+        size_t get_eof_symbol() const { return SYMBOL_COUNT; }
     };
     
     struct BitOutput {
@@ -1657,14 +1632,14 @@ public:
         BitOutput bit_out;
         
         for (uint8_t symbol : nibbles) {
-            uint32_t range = high - low + 1;
+            uint64_t range = static_cast<uint64_t>(high) - low + 1;
             size_t total = freq.get_total();
             
             uint32_t low_count = static_cast<uint32_t>(freq.get_low(symbol));
             uint32_t high_count = static_cast<uint32_t>(freq.get_high(symbol));
             
-            high = low + (range * high_count) / total - 1;
-            low = low + (range * low_count) / total;
+            high = static_cast<uint32_t>(low + (range * high_count) / total - 1);
+            low = static_cast<uint32_t>(low + (range * low_count) / total);
             freq.update(symbol);
             
             while (true) {
@@ -1686,58 +1661,92 @@ public:
             }
         }
         
-        uint8_t eof = static_cast<uint8_t>(freq.get_eof_symbol());
-        uint32_t range = high - low + 1;
+        size_t eof = freq.get_eof_symbol();
+        uint64_t range = static_cast<uint64_t>(high) - low + 1;
         size_t total = freq.get_total();
         
         uint32_t low_count = static_cast<uint32_t>(freq.get_low(eof));
         uint32_t high_count = static_cast<uint32_t>(freq.get_high(eof));
         
-        high = low + (range * high_count) / total - 1;
-        low = low + (range * low_count) / total;
-        
+        high = static_cast<uint32_t>(low + (range * high_count) / total - 1);
+        low = static_cast<uint32_t>(low + (range * low_count) / total);
+
+        while (true) {
+            if ((low & HALF) == (high & HALF)) {
+                bit_out.write((low >> 31) & 1);
+                while (pending > 0) {
+                    bit_out.write(((low >> 31) & 1) ^ 1);
+                    pending--;
+                }
+                low <<= 1;
+                high = (high << 1) | 1;
+            } else if (low >= QUARTER && high < QUARTER * 3) {
+                pending++;
+                low -= QUARTER;
+                high -= QUARTER;
+                low <<= 1;
+                high = (high << 1) | 1;
+            } else {
+                break;
+            }
+        }
+
         pending++;
-        bit_out.write((low >> 31) & 1);
-        while (pending > 0) {
-            bit_out.write(((low >> 31) & 1) ^ 1);
+        const uint8_t final_bit = low < QUARTER ? 0 : 1;
+        bit_out.write(final_bit);
+        while (pending > 1) {
+            bit_out.write(final_bit ^ 1);
             pending--;
         }
         
-        return bit_out.to_nibbles();
+        std::vector<uint8_t> output;
+        uint32_t input_size = static_cast<uint32_t>(nibbles.size());
+        for (unsigned shift = 0; shift < 32; shift += 4) {
+            output.push_back(static_cast<uint8_t>((input_size >> shift) & 0x0F));
+        }
+        std::vector<uint8_t> encoded_bits = bit_out.to_nibbles();
+        output.insert(output.end(), encoded_bits.begin(), encoded_bits.end());
+        return output;
     }
     
     std::vector<uint8_t> decompress(const std::vector<uint8_t>& compressed) override {
         std::vector<uint8_t> output;
-        if (compressed.empty()) return output;
-        
-        BitInput bit_in(compressed);
+        if (compressed.size() < 8) throw std::runtime_error("Truncated arithmetic stream");
+        uint32_t expected_size = 0;
+        for (unsigned shift = 0; shift < 32; shift += 4) {
+            expected_size |= static_cast<uint32_t>(compressed[shift / 4] & 0x0F) << shift;
+        }
+        BitInput bit_in(std::vector<uint8_t>(compressed.begin() + 8, compressed.end()));
         FrequencyTable freq;
         
         uint32_t low = 0, high = MAX_RANGE, value = 0;
-        for (int i = 0; i < 32 && bit_in.has_bits(); i++) value = (value << 1) | bit_in.read();
+        for (int i = 0; i < 32; i++) value = (value << 1) | bit_in.read();
         
         size_t eof_symbol = freq.get_eof_symbol();
         
-        while (bit_in.has_bits() && output.size() < 1000000) {
-            uint32_t range = high - low + 1;
-            uint32_t scaled_value = ((value - low + 1) * freq.get_total() - 1) / range;
+        while (output.size() < expected_size) {
+            uint64_t range = static_cast<uint64_t>(high) - low + 1;
+            uint64_t scaled_value =
+                ((static_cast<uint64_t>(value) - low + 1) * freq.get_total() - 1) / range;
             
-            uint8_t symbol = 0;
-            for (size_t i = 0; i <= NIBBLE_VALUES; i++) {
+            size_t symbol = 0;
+            for (size_t i = 0; i <= SYMBOL_COUNT; i++) {
                 if (scaled_value < freq.cumulative[i + 1]) {
-                    symbol = static_cast<uint8_t>(i);
+                    symbol = i;
                     break;
                 }
             }
             
-            if (symbol == eof_symbol) break;
-            output.push_back(symbol);
+            if (symbol == eof_symbol) {
+                throw std::runtime_error("Arithmetic stream ended before declared length");
+            }
+            output.push_back(static_cast<uint8_t>(symbol));
             
             uint32_t low_count = static_cast<uint32_t>(freq.get_low(symbol));
             uint32_t high_count = static_cast<uint32_t>(freq.get_high(symbol));
             
-            high = low + (range * high_count) / freq.get_total() - 1;
-            low = low + (range * low_count) / freq.get_total();
+            high = static_cast<uint32_t>(low + (range * high_count) / freq.get_total() - 1);
+            low = static_cast<uint32_t>(low + (range * low_count) / freq.get_total());
             freq.update(symbol);
             
             while (true) {
@@ -1755,7 +1764,6 @@ public:
                 } else break;
             }
         }
-        
         return output;
     }
     
@@ -1785,13 +1793,19 @@ private:
     
     std::array<uint16_t, 17> code_lengths;
     std::array<uint16_t, 17> first_codes;
+    std::array<uint16_t, 17> length_counts;
     
     void build_canonical_codes() {
+        length_counts.fill(0);
+        for (size_t symbol = 0; symbol < 16; ++symbol) {
+            if (code_lengths[symbol] > 0 && code_lengths[symbol] <= 16) {
+                length_counts[code_lengths[symbol]]++;
+            }
+        }
         uint16_t code = 0;
         for (size_t len = 1; len <= 16; len++) {
-            code <<= 1;
+            code = static_cast<uint16_t>((code + length_counts[len - 1]) << 1);
             first_codes[len] = code;
-            code += code_lengths[len];
         }
     }
     
@@ -1823,19 +1837,32 @@ public:
             else { get_lengths(node->left, depth + 1); get_lengths(node->right, depth + 1); }
         };
         get_lengths(pq.top(), 0);
+        if (pq.top()->left == nullptr && pq.top()->right == nullptr) {
+            code_lengths[pq.top()->symbol] = 1;
+        }
         
         delete pq.top();
         build_canonical_codes();
-        
+        output.push_back(16);
         for (size_t i = 0; i < 16; i++) output.push_back(static_cast<uint8_t>(code_lengths[i]));
+        const uint32_t input_size = static_cast<uint32_t>(nibbles.size());
+        for (unsigned shift = 0; shift < 32; shift += 8) {
+            output.push_back(static_cast<uint8_t>(input_size >> shift));
+        }
         
         std::vector<uint8_t> bits;
+        std::array<uint16_t, 17> next_codes = first_codes;
+        std::array<uint16_t, 16> symbol_codes{};
+        for (size_t symbol = 0; symbol < symbol_codes.size(); ++symbol) {
+            if (code_lengths[symbol] > 0) {
+                symbol_codes[symbol] = next_codes[code_lengths[symbol]]++;
+            }
+        }
         for (uint8_t n : nibbles) {
-            uint16_t code = first_codes[code_lengths[n]];
+            uint16_t code = symbol_codes[n];
             for (size_t i = 0; i < code_lengths[n]; i++) {
                 bits.push_back((code >> (code_lengths[n] - 1 - i)) & 1);
             }
-            first_codes[code_lengths[n]]++;
         }
         
         for (size_t i = 0; i < bits.size(); i += 4) {
@@ -1850,7 +1877,56 @@ public:
     }
     
     std::vector<uint8_t> decompress(const std::vector<uint8_t>& compressed) override {
-        throw std::runtime_error("NibbleHuffman decompress not implemented");
+        if (compressed.empty()) return {};
+        if (compressed.size() < 21 || compressed[0] != 16) {
+            throw std::runtime_error("Invalid Huffman stream");
+        }
+        code_lengths.fill(0);
+        for (size_t symbol = 0; symbol < 16; ++symbol) {
+            code_lengths[symbol] = compressed[symbol + 1];
+        }
+        build_canonical_codes();
+        uint32_t expected_size = 0;
+        for (unsigned shift = 0; shift < 32; shift += 8) {
+            expected_size |= static_cast<uint32_t>(compressed[17 + shift / 8]) << shift;
+        }
+
+        std::vector<uint8_t> bit_nibbles(compressed.begin() + 21, compressed.end());
+        std::vector<uint8_t> output;
+        output.reserve(expected_size);
+        size_t nibble_pos = 0;
+        size_t bit_pos = 0;
+        for (uint32_t item = 0; item < expected_size; ++item) {
+            uint16_t code = 0;
+            bool found = false;
+            for (size_t length = 1; length <= 16 && !found; ++length) {
+                if (nibble_pos >= bit_nibbles.size()) {
+                    throw std::runtime_error("Truncated Huffman bitstream");
+                }
+                const uint8_t bit = (bit_nibbles[nibble_pos] >> bit_pos) & 1;
+                code = static_cast<uint16_t>((code << 1) | bit);
+                if (++bit_pos == 4) {
+                    bit_pos = 0;
+                    ++nibble_pos;
+                }
+                uint16_t first = first_codes[length];
+                if (code >= first && code - first < length_counts[length]) {
+                    size_t offset = code - first;
+                    for (size_t symbol = 0; symbol < 16; ++symbol) {
+                        if (code_lengths[symbol] == length) {
+                            if (offset == 0) {
+                                output.push_back(static_cast<uint8_t>(symbol));
+                                found = true;
+                                break;
+                            }
+                            --offset;
+                        }
+                    }
+                }
+            }
+            if (!found) throw std::runtime_error("Invalid Huffman code");
+        }
+        return output;
     }
     
     std::string get_name() const override { return "NibbleHuffman"; }
@@ -1859,18 +1935,250 @@ public:
 
 } // namespace nibble
 
-#endif // NIBBLE_BACKENDS_HPP
-File 4: nibble_encoder_builder.hpp (Builder Pattern)
-cpp
-// nibble_encoder_builder.hpp
-#ifndef NIBBLE_ENCODER_BUILDER_HPP
-#define NIBBLE_ENCODER_BUILDER_HPP
-
-#include "nibble_encoder.hpp"
-#include "nibble_transforms.hpp"
-#include "nibble_backends.hpp"
-
 namespace nibble {
+
+template<typename CharT>
+class NibbleEncoder {
+private:
+    struct AppliedTransform {
+        std::vector<uint8_t> metadata;
+    };
+
+    std::vector<std::unique_ptr<ITransform<CharT>>> transforms;
+    std::unique_ptr<IBackendCompressor<CharT>> backend;
+    std::vector<std::string> dictionary;
+
+    static void append_u32(std::vector<uint8_t>& output, uint32_t value) {
+        for (unsigned shift = 0; shift < 32; shift += 8) {
+            output.push_back(static_cast<uint8_t>(value >> shift));
+        }
+    }
+
+    static uint32_t read_u32(const std::vector<uint8_t>& input, size_t& pos) {
+        if (pos > input.size() || input.size() - pos < 4) {
+            throw std::runtime_error("Truncated nibble archive");
+        }
+        uint32_t value = 0;
+        for (unsigned shift = 0; shift < 32; shift += 8) {
+            value |= static_cast<uint32_t>(input[pos++]) << shift;
+        }
+        return value;
+    }
+
+    static bool is_word_byte(unsigned char value) {
+        return (value >= 'a' && value <= 'z') ||
+               (value >= 'A' && value <= 'Z') ||
+               (value >= '0' && value <= '9') || value >= 0x80;
+    }
+
+    std::vector<uint8_t> tokenize(const std::string& text) const {
+        std::vector<uint8_t> output;
+        for (size_t pos = 0; pos < text.size();) {
+            size_t match = dictionary.size();
+            for (size_t i = 0; i < dictionary.size(); ++i) {
+                const std::string& word = dictionary[i];
+                if (word.empty() || pos + word.size() > text.size() ||
+                    text.compare(pos, word.size(), word) != 0) {
+                    continue;
+                }
+                const bool left_boundary = pos == 0 ||
+                    !is_word_byte(static_cast<unsigned char>(text[pos - 1]));
+                const bool right_boundary = pos + word.size() == text.size() ||
+                    !is_word_byte(static_cast<unsigned char>(text[pos + word.size()]));
+                if (left_boundary && right_boundary &&
+                    (match == dictionary.size() ||
+                     word.size() > dictionary[match].size())) {
+                    match = i;
+                }
+            }
+
+            if (match != dictionary.size()) {
+                output.push_back(0xFF);
+                output.push_back(0x00);
+                output.push_back(static_cast<uint8_t>(match & 0xFF));
+                output.push_back(static_cast<uint8_t>((match >> 8) & 0xFF));
+                pos += dictionary[match].size();
+            } else {
+                uint8_t value = static_cast<uint8_t>(text[pos++]);
+                output.push_back(value);
+                if (value == 0xFF) output.push_back(0xFF);
+            }
+        }
+        return output;
+    }
+
+    std::string detokenize(const std::vector<uint8_t>& input) const {
+        std::string output;
+        for (size_t pos = 0; pos < input.size();) {
+            uint8_t value = input[pos++];
+            if (value != 0xFF) {
+                output.push_back(static_cast<char>(value));
+                continue;
+            }
+            if (pos >= input.size()) {
+                throw std::runtime_error("Invalid dictionary escape");
+            }
+            uint8_t kind = input[pos++];
+            if (kind == 0xFF) {
+                output.push_back(static_cast<char>(0xFF));
+            } else if (kind == 0x00 && input.size() - pos >= 2) {
+                size_t index = input[pos] | (static_cast<size_t>(input[pos + 1]) << 8);
+                pos += 2;
+                if (index >= dictionary.size()) {
+                    throw std::runtime_error("Dictionary entry is unavailable");
+                }
+                output += dictionary[index];
+            } else {
+                throw std::runtime_error("Invalid dictionary token");
+            }
+        }
+        return output;
+    }
+
+    static std::unique_ptr<IBackendCompressor<CharT>> make_backend(BackendID id) {
+        switch (id) {
+            case BackendID::NONE: return nullptr;
+            case BackendID::LZ77: return std::make_unique<NibbleLZ77Compressor<CharT>>();
+            case BackendID::RLE: return std::make_unique<NibbleRLECompressor<CharT>>();
+            case BackendID::ARITHMETIC: return std::make_unique<NibbleArithmeticCompressor<CharT>>();
+            case BackendID::HUFFMAN: return std::make_unique<NibbleHuffmanCompressor<CharT>>();
+        }
+        throw std::runtime_error("Unknown nibble backend");
+    }
+
+public:
+    void add_transform(std::unique_ptr<ITransform<CharT>> transform) {
+        if (!transform) throw std::invalid_argument("Transform must not be null");
+        transforms.push_back(std::move(transform));
+    }
+
+    void set_backend(std::unique_ptr<IBackendCompressor<CharT>> compressor) {
+        backend = std::move(compressor);
+    }
+
+    void load_templates(const std::string&) {}
+
+    void load_dictionary(const std::string& filename) {
+        std::ifstream file(filename);
+        if (!file) throw std::runtime_error("Unable to open dictionary: " + filename);
+        std::vector<std::string> loaded;
+        std::string word;
+        while (std::getline(file, word)) {
+            if (!word.empty() && word.back() == '\r') word.pop_back();
+            if (!word.empty()) loaded.push_back(std::move(word));
+        }
+        if (loaded.size() > 65536) {
+            throw std::runtime_error("Dictionary exceeds 65536 entries");
+        }
+        dictionary = std::move(loaded);
+    }
+
+    std::string encode(const std::string& text) {
+        std::vector<uint8_t> source = tokenize(text);
+        std::vector<uint8_t> data;
+        data.reserve(source.size() * 2);
+        for (uint8_t byte : source) {
+            data.push_back(byte >> 4);
+            data.push_back(byte & 0x0F);
+        }
+
+        std::vector<AppliedTransform> applied;
+        applied.reserve(transforms.size());
+        for (auto& transform : transforms) {
+            std::vector<uint8_t> metadata = transform->apply(data);
+            applied.push_back({std::move(metadata)});
+        }
+
+        std::vector<uint8_t> payload = backend ? backend->compress(data) : data;
+        const uint32_t payload_units = static_cast<uint32_t>(payload.size());
+        if (backend && backend->get_id() == BackendID::ARITHMETIC) {
+            payload = utils::pack_nibbles(payload);
+        }
+        std::vector<uint8_t> archive{'N', 'I', 'B', '2',
+            static_cast<uint8_t>(backend ? backend->get_id() : BackendID::NONE)};
+        if (applied.size() > 255) {
+            throw std::runtime_error("Too many transforms in encoder pipeline");
+        }
+        archive.push_back(static_cast<uint8_t>(applied.size()));
+        for (size_t i = 0; i < applied.size(); ++i) {
+            archive.push_back(static_cast<uint8_t>(transforms[i]->get_id()));
+            append_u32(archive, static_cast<uint32_t>(applied[i].metadata.size()));
+            archive.insert(archive.end(), applied[i].metadata.begin(), applied[i].metadata.end());
+        }
+        append_u32(archive, payload_units);
+        append_u32(archive, static_cast<uint32_t>(payload.size()));
+        archive.insert(archive.end(), payload.begin(), payload.end());
+        return std::string(archive.begin(), archive.end());
+    }
+
+    std::string decode(const std::string& encoded) {
+        std::vector<uint8_t> archive(encoded.begin(), encoded.end());
+        if (archive.size() < 14 || archive[0] != 'N' || archive[1] != 'I' ||
+            archive[2] != 'B' || archive[3] != '2') {
+            throw std::runtime_error("Invalid nibble archive");
+        }
+        size_t pos = 4;
+        auto decoder = make_backend(static_cast<BackendID>(archive[pos++]));
+        size_t transform_count = archive[pos++];
+        std::vector<std::pair<TransformID, std::vector<uint8_t>>> metadata;
+        metadata.reserve(transform_count);
+        for (size_t i = 0; i < transform_count; ++i) {
+            if (pos >= archive.size()) throw std::runtime_error("Truncated transform metadata");
+            TransformID id = static_cast<TransformID>(archive[pos++]);
+            uint32_t length = read_u32(archive, pos);
+            if (length > archive.size() - pos) throw std::runtime_error("Truncated transform metadata");
+            metadata.emplace_back(id, std::vector<uint8_t>(
+                archive.begin() + pos, archive.begin() + pos + length));
+            pos += length;
+        }
+        uint32_t payload_units = read_u32(archive, pos);
+        uint32_t payload_size = read_u32(archive, pos);
+        if (payload_size != archive.size() - pos) throw std::runtime_error("Invalid nibble payload size");
+        std::vector<uint8_t> payload(archive.begin() + pos, archive.end());
+        if (decoder && decoder->get_id() == BackendID::ARITHMETIC) {
+            if (payload_size != (payload_units + 1) / 2) {
+                throw std::runtime_error("Invalid packed arithmetic payload size");
+            }
+            payload = utils::unpack_nibbles(payload);
+            payload.resize(payload_units);
+        }
+        std::vector<uint8_t> data = decoder ? decoder->decompress(payload) : std::move(payload);
+
+        for (size_t i = metadata.size(); i > 0; --i) {
+            const auto& item = metadata[i - 1];
+            std::unique_ptr<ITransform<CharT>> transform;
+            switch (item.first) {
+                case TransformID::XOR_MEAN_NORMALIZE: transform = std::make_unique<XORMeanNormalizeTransform<CharT>>(); break;
+                case TransformID::BWT: transform = std::make_unique<BWTTransform<CharT>>(); break;
+                case TransformID::MTF: transform = std::make_unique<MTFTransform<CharT>>(); break;
+                case TransformID::RLE: transform = std::make_unique<RLETransform<CharT>>(); break;
+                case TransformID::FREQ_SORT: transform = std::make_unique<FreqSortTransform<CharT>>(); break;
+                case TransformID::CONTEXT_SORT: transform = std::make_unique<ContextSortTransform<CharT>>(); break;
+                case TransformID::PREDICTIVE_NIBBLE_LAG: transform = std::make_unique<PredictiveNibbleLagTransform<CharT>>(); break;
+                case TransformID::HIDDEN_MARKOV_CHAIN: transform = std::make_unique<HMCTransform<CharT>>(); break;
+                case TransformID::COMBINED_PREDICTOR: transform = std::make_unique<CombinedPredictorTransform<CharT>>(); break;
+                case TransformID::XOR_AVT: transform = std::make_unique<XORAVTTransform<CharT>>(); break;
+                case TransformID::PATTERN_MATCH: transform = std::make_unique<PatternMatchTransform<CharT>>(); break;
+                case TransformID::MULTIMOVE_CHAIN: transform = std::make_unique<MultimoveChainTransform<CharT>>(); break;
+                case TransformID::WAVELET_TREE: transform = std::make_unique<WaveletTreeTransform<CharT>>(); break;
+                case TransformID::ADAPTIVE: transform = std::make_unique<AdaptiveTransform<CharT>>(); break;
+                default: throw std::runtime_error("Unknown transform in nibble archive");
+            }
+            transform->reverse(data, item.second);
+        }
+
+        if (data.size() % 2 != 0) throw std::runtime_error("Invalid nibble stream length");
+        std::vector<uint8_t> source;
+        source.reserve(data.size() / 2);
+        for (size_t i = 0; i < data.size(); i += 2) {
+            if (data[i] > 0x0F || data[i + 1] > 0x0F) {
+                throw std::runtime_error("Invalid nibble value");
+            }
+            source.push_back(static_cast<uint8_t>((data[i] << 4) | data[i + 1]));
+        }
+        return detokenize(source);
+    }
+};
 
 // ============================================================================
 // ENHANCED BUILDER WITH TRANSFORM INTEGRATION
@@ -1997,9 +2305,7 @@ public:
     NibbleEncoderBuilder& with_english_text_pipeline() {
         return add_xor_mean_normalize()
                .add_bwt()
-               .add_context_sort()
-               .add_pnl()
-               .add_pattern_match()
+               .add_mtf()
                .with_arithmetic_backend();
     }
     
@@ -2096,4 +2402,4 @@ public:
 
 } // namespace nibble
 
-#endif // NIBBLE_ENCODER_BUILDER_HPP
+#endif // NIBBLE_ENCODER_HPP
